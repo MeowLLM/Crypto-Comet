@@ -144,7 +144,6 @@ def show_progress(symbol: str, year: int, final=False):
         flush=True
     )
 
-
 YEAR_RE = re.compile(r"(20[1-3][0-9])")
 
 def extract_years(path: str):
@@ -195,13 +194,18 @@ SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Binance-Kline-Collector/1.0)
 _last_req_time = 0.0
 _rate_lock = threading.Lock()
 
+import random
 def ratelimit():
     global _last_req_time
     with _rate_lock:
         now = time.time()
         delta = now - _last_req_time
+
+        # add jitter to break mass sync sleep
         if delta < RATE_INTERVAL:
-            time.sleep(RATE_INTERVAL - delta)
+            sleep_time = (RATE_INTERVAL - delta) * (1 + 0.35 * random.random())
+            time.sleep(sleep_time)
+
         _last_req_time = time.time()
 
 def make_shards(start_ts: int, end_ts: int, shard_minutes: int = 1000):
@@ -219,7 +223,18 @@ def fetch_shard(symbol: str, interval: str, start_ts: int, end_ts: int):
     out = []
     t = start_ts
 
-    while t <= end_ts:
+    empty_count = 0
+    network_fail = 0
+
+    MAX_EMPTY = 5         # beyond this, shard ends
+    MAX_FAIL  = 5         # avoids freeze on network errors
+    MAX_SPIN  = 200       # overall safety
+
+    spin = 0
+
+    while t <= end_ts and spin < MAX_SPIN:
+        spin += 1
+
         params = {
             "symbol": symbol,
             "interval": interval,
@@ -232,24 +247,44 @@ def fetch_shard(symbol: str, interval: str, start_ts: int, end_ts: int):
 
         try:
             r = SESSION.get(url, params=params, timeout=5)
+
+            # Hard 429 fix: apply variable backoff
             if r.status_code == 429:
-                time.sleep(0.3)
+                time.sleep(0.25 + 0.25 * random.random())
                 continue
 
             if r.status_code != 200:
-                time.sleep(0.1)
+                network_fail += 1
+                if network_fail > MAX_FAIL:
+                    break
+                time.sleep(0.15)
                 continue
 
             data = r.json()
-            if not data:
-                t += 60_000
-                continue
-
-            out.extend(data)
-            t = data[-1][6] + 1
 
         except Exception:
-            time.sleep(0.1)
+            network_fail += 1
+            if network_fail > MAX_FAIL:
+                break
+            time.sleep(0.15 + 0.15 * random.random())
+            continue
+
+        # --- empty response case (danger zone) ---
+        if not data:
+            empty_count += 1
+            if empty_count > MAX_EMPTY:
+                break
+            # skip ahead 1 candle
+            t += 60_000
+            continue
+
+        # --- valid data ---
+        empty_count = 0
+        network_fail = 0
+        out.extend(data)
+
+        # next time window
+        t = data[-1][6] + 1
 
     return out
 
